@@ -1,89 +1,172 @@
 import torch
 import torch.nn as nn
-from ml_collections import ConfigDict
-from config.config import get_config
 
-config = get_config()
-filters_down = config.model.filters_down
-filters_up = config.model.filters_up
-kernel_size_conv = config.model.kernel_size_conv
-padding_conv = config.model.padding_conv
-pool_size = config.model.pool_size
-kernel_transpose = config.model.kernel_size_conv_transpose
-stride_transpose = config.model.stride_transpose
 
 '''
 I am taking reference (with modifications for my own learning) from:
-1. https://debuggercafe.com/unet-from-scratch-using-pytorch/
-2. https://github.com/sdsubhajitdas/Brain-Tumor-Segmentation/blob/master/bts/model.py
+
+1. https://github.com/sdsubhajitdas/Brain-Tumor-Segmentation/blob/master/bts/model.py
+2. https://gist.github.com/shuuchen/6d39225b018d30ccc86ef10a4042b1aa
+3. https://medium.com/@AIchemizt/attention-u-net-in-pytorch-step-by-step-guide-with-code-and-explanation-417d80a6dfd0
+4. 
 '''
-def conv_double(filters, i, kernel_size_conv, padding_conv):
-   '''
-   Padded version
-   Conv2d + ReLU + Conv2d 
-   filters_down: list of filters for downsampling path including in_channels
-   i: index of current layer [1, len(filters_down)]
-   '''
-   if len(filters_down) < 6:
-       raise ValueError("filter down list must have at least 6 elements (including in_channels), currently have {len(filters_down)}")
-   out = nn.Sequential(
-        nn.Conv2d(in_channels=filters[i-1], out_channels=filters[i], kernel_size=kernel_size_conv, padding=padding_conv),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=filters[i], out_channels=filters[i], kernel_size=kernel_size_conv, padding=padding_conv),
-   )
-   return out
+
+####### Universal Building Blocks for UNet #######
+class conv_double(nn.Module):
+    def __init__(self, filters, i, kernel_size_conv, padding_conv):
+        super(conv_double, self).__init__()
+        if len(filters) < 6:
+            raise ValueError(f"filter list must have at least 6 elements, currently have {len(filters)}")
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channels=filters[i-1], out_channels=filters[i], kernel_size=kernel_size_conv, padding=padding_conv),
+            nn.BatchNorm2d(num_features=filters[i]),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(in_channels=filters[i], out_channels=filters[i], kernel_size=kernel_size_conv, padding=padding_conv),
+            nn.BatchNorm2d(num_features=filters[i]),
+            nn.ReLU(inplace=True)
+        )
+    def forward(self, x):
+        return self.block(x)
+
+
+class encoder_block(nn.Module):
+    def __init__(self, filters, kernel_size_conv, padding_conv, pool_size, depth=5):
+        super(encoder_block, self).__init__()
+
+        self.pool = nn.MaxPool2d(kernel_size=pool_size, stride=pool_size)
+        self.conv = nn.ModuleList()
+        for i in range(1, depth+1):
+            self.conv.append(conv_double(filters, i, kernel_size_conv, padding_conv))
+   
+        
+    def forward(self, x):
+        out = []
+        for i, conv_layer in enumerate(self.conv):
+            if i>0:
+                x = self.pool(x)
+            x = conv_layer(x)
+            out.append(x)
+        return out
+
+class deconv_double(nn.Module):
+    def __init__(self, filters, i, kernel_size_conv, padding_conv, kernel_transpose, stride_transpose):
+        super(deconv_double, self).__init__()
+
+        self.uptrans = nn.ConvTranspose2d(in_channels=filters[i-1], out_channels=filters[i], kernel_size=kernel_transpose, stride=stride_transpose)
+        self.up = conv_double(filters, i, kernel_size_conv, padding_conv)
+
+    def forward(self, x, enc):
+        x = self.uptrans(x)
+        x = torch.cat([x, enc], dim=1)
+        x = self.up(x)
+        return x
 
 
 
-class UNet_vanilla(nn.Module):
-   def __init__(self, filters_down, kernel_size_conv, padding_conv):
-       super(UNet_vanilla, self).__init__()
-       self.conv1 = conv_double(filters=filters_down, i=1, kernel_size_conv=kernel_size_conv, padding_conv=padding_conv)
-       self.conv2 = conv_double(filters=filters_down, i=2, kernel_size_conv=kernel_size_conv, padding_conv=padding_conv)
-       self.conv3 = conv_double(filters=filters_down, i=3, kernel_size_conv=kernel_size_conv, padding_conv=padding_conv)
-       self.conv4 = conv_double(filters=filters_down, i=4, kernel_size_conv=kernel_size_conv, padding_conv=padding_conv)
-       self.conv5 = conv_double(filters=filters_down, i=5, kernel_size_conv=kernel_size_conv, padding_conv=padding_conv)
+class decoder_block(nn.Module):
+    def __init__(self, filters, kernel_size_conv, padding_conv, kernel_transpose, stride_transpose, depth=5):
+        super(decoder_block, self).__init__()
 
-       self.pool = nn.MaxPool2d(kernel_size=pool_size, stride=pool_size)
+        self.depth = depth
+        self.deconv = nn.ModuleList()
+        for i in range(1, self.depth):
+            self.deconv.append(deconv_double(filters, i, kernel_size_conv, padding_conv, kernel_transpose, stride_transpose))
 
-       self.uptrans1 = nn.ConvTranspose2d(in_channels=filters_up[0], out_channels=filters_up[1], kernel_size=kernel_transpose, stride=stride_transpose)
-       self.up1 = conv_double(filters=filters_up, i=1, kernel_size_conv=kernel_size_conv, padding_conv=padding_conv)
-       self.uptrans2 = nn.ConvTranspose2d(in_channels=filters_up[1], out_channels=filters_up[2], kernel_size=kernel_transpose, stride=stride_transpose)
-       self.up2 = conv_double(filters=filters_up, i=2, kernel_size_conv=kernel_size_conv, padding_conv=padding_conv)
-       self.uptrans3 = nn.ConvTranspose2d(in_channels=filters_up[2], out_channels=filters_up[3], kernel_size=kernel_transpose, stride=stride_transpose)
-       self.up3 = conv_double(filters=filters_up, i=3, kernel_size_conv=kernel_size_conv, padding_conv=padding_conv)
-       self.uptrans4 = nn.ConvTranspose2d(in_channels=filters_up[3], out_channels=filters_up[4], kernel_size=kernel_transpose, stride=stride_transpose)
-       self.up4 = conv_double(filters=filters_up, i=4, kernel_size_conv=kernel_size_conv, padding_conv=padding_conv)
-       self.out = nn.Conv2d(in_channels=filters_up[4], out_channels=filters_up[5], kernel_size=1)
+    def forward(self, enc_features):
+        for i, deconv_layer in enumerate(self.deconv):
+            if i==0:
+                x = enc_features.pop()
+            bridge = enc_features.pop()
+            x = deconv_layer(x, bridge)
+
+        return x
+    
+######### Attention Building Blocks for UNet #########
+
+class att_gate(nn.Module):
+    def __init__(self, F_g, F_l, F_int):
+        super(att_gate, self).__init__()
+        self.W_g = nn.Sequential(
+            nn.Conv2d(F_g, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+
+        self.W_x = nn.Sequential(
+            nn.Conv2d(F_l, F_int, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(F_int)
+        )
+
+        self.psi = nn.Sequential(
+            nn.Conv2d(F_int, 1, kernel_size=1, stride=1, padding=0, bias=True),
+            nn.BatchNorm2d(1),
+            nn.Sigmoid()
+        )
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, g, x):
+        g1 = self.W_g(g)
+        x1 = self.W_x(x)
+        psi = self.relu(g1 + x1)
+        psi = self.psi(psi)
+        return x * psi
+    
+class deconv_double_att(nn.Module):
+    def __init__(self, filters, i, kernel_size_conv, padding_conv, kernel_transpose, stride_transpose, attn=None):
+        super(deconv_double_att, self).__init__()
+
+        self.uptrans = nn.ConvTranspose2d(in_channels=filters[i-1], out_channels=filters[i], kernel_size=kernel_transpose, stride=stride_transpose)
+        self.up = conv_double(filters, i, kernel_size_conv, padding_conv)
+        self.att = att_gate(F_g=filters[i], F_l=filters[i], F_int=filters[i]//2)
+        self.attn = attn
+
+    def forward(self, x, enc):
+        x = self.uptrans(x)
+        if self.attn:
+            enc = self.att(g=x, x=enc)
+        x = torch.cat([x, enc], dim=1)
+        x = self.up(x)
+        return x
+    
+
+class decoder_block_att(nn.Module):
+    def __init__(self, filters, kernel_size_conv, padding_conv, kernel_transpose, stride_transpose, depth=5, attn=True):
+        super(decoder_block_att, self).__init__()
+
+        self.depth = depth
+        self.deconv = nn.ModuleList()
+        for i in range(1, self.depth):
+            if attn:
+                self.deconv.append(deconv_double_att(filters, i, kernel_size_conv, padding_conv, kernel_transpose, stride_transpose, attn=True))
+            else:
+                self.deconv.append(deconv_double_att(filters, i, kernel_size_conv, padding_conv, kernel_transpose, stride_transpose, attn=False))       
+
+    def forward(self, enc_features):
+        for i, deconv_layer in enumerate(self.deconv):
+            if i==0:
+                x = enc_features.pop()
+            bridge = enc_features.pop()
+            x = deconv_layer(x, bridge)
+
+        return x
 
 
-   def forward(self, x):
-       x1 = self.conv1(x)
-       p1 = self.pool(x1)
-       x2 = self.conv2(p1)
-       p2 = self.pool(x2)
-       x3 = self.conv3(p2)
-       p3 = self.pool(x3)
-       x4 = self.conv4(p3)
-       p4 = self.pool(x4)
-       x5 = self.conv5(p4)
-
-       x6 = self.uptrans1(x5)
-       x7 = self.up1(torch.cat([x6, x4], dim=1))
-       x8 = self.uptrans2(x7)
-       x9 = self.up2(torch.cat([x8, x3], dim=1))
-       x10 = self.uptrans3(x9)
-       x11 = self.up3(torch.cat([x10, x2], dim=1))
-       x12 = self.uptrans4(x11)
-       x13 = self.up4(torch.cat([x12, x1], dim=1))
-       x14 = self.out(x13)
-       return x14
+######### Residual Building Blocks for UNet #########
+class ResidualBlock(nn.Module):
+    def __init__(self, filters, i, kernel_size_conv, padding_conv):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels=filters[i-1], out_channels=filters[i], kernel_size=kernel_size_conv, padding=padding_conv)
+        self.bn1 = nn.BatchNorm2d(num_features=filters[i-1])
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(in_channels=filters[i], out_channels=filters[i], kernel_size=kernel_size_conv, padding=padding_conv)
+        self.bn2 = nn.BatchNorm2d(num_features=filters[i])
+    def forward(self, x):
+        x = self.bn1(x)
+        x = self.relu(x)
+        x = self.conv1(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        return x
 
 
-if __name__ == "__main__":
-    model = UNet_vanilla(filters_down=filters_down, kernel_size_conv=kernel_size_conv, padding_conv=padding_conv)
-    print(model)
-    x = torch.randn((1, 1, 256, 256))  #batch_size=1, in_channels=1, H=256, W=256
-    print("Input shape:", x.shape)
-    y = model(x)
-    print("Output shape:", y.shape)
